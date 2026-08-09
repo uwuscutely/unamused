@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.11.7] - 2026-08-09
+
 - Retry YouTube playback after pre-audio FFmpeg 403 responses using alternate `yt-dlp` player clients with client-appropriate cookie handling.
 - Announce exhausted YouTube player clients in the playback channel and continue automatically to the next queued song.
 - Fix `/skip` interactions timing out after successfully advancing the queue and reject skips with no next song before changing playback state.
@@ -410,7 +412,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Initial release
 
-[unreleased]: https://github.com/uwuscutely/unamused/compare/v2.11.6...HEAD
+[unreleased]: https://github.com/uwuscutely/unamused/compare/v2.11.7...HEAD
+[2.11.7]: https://github.com/uwuscutely/unamused/compare/v2.11.6...v2.11.7
 [2.11.6]: https://github.com/museofficial/muse/compare/v2.11.5...v2.11.6
 [2.11.5]: https://github.com/museofficial/muse/compare/v2.11.4...v2.11.5
 [2.11.4]: https://github.com/museofficial/muse/compare/v2.11.3...v2.11.4
