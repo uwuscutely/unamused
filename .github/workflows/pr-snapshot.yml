@@ -3,7 +3,7 @@ name: Build snapshot of PR
 on: pull_request
 
 env:
-  REGISTRY_IMAGE: ghcr.io/museofficial/muse
+  REGISTRY_IMAGE: ghcr.io/uwuscutely/unamused
 
 jobs:
   build:
@@ -12,11 +12,11 @@ jobs:
       matrix:
         runner-platform:
           - ubuntu-latest
-          - namespace-profile-default-arm64
+          - ubuntu-24.04-arm
         include:
           - runner-platform: ubuntu-latest
             build-arch: linux/amd64
-          - runner-platform: namespace-profile-default-arm64
+          - runner-platform: ubuntu-24.04-arm
             build-arch: linux/arm64
     runs-on: ${{ matrix.runner-platform }}
     steps:
@@ -39,7 +39,7 @@ jobs:
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
-          username: ${{ github.repository_owner }}
+          username: uwuscutely
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Get current time

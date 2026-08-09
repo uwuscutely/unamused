@@ -76,7 +76,7 @@ vi.mock('../src/utils/debug.js', () => ({
   default: dependencyMocks.debug,
 }));
 
-import Player, {MediaSource, QueuedSong} from '../src/services/player.js';
+import Player, {AllPlayerClientsExhaustedError, MediaSource, QueuedSong} from '../src/services/player.js';
 import ThirdParty from '../src/services/third-party.js';
 import prepareYtDlp from '../src/utils/prepare-yt-dlp.js';
 import {getExecutable, getYouTubeMediaSource, getYtDlpVersion, updateYtDlp} from '../src/utils/yt-dlp.js';
@@ -553,6 +553,36 @@ describe('OPS-11 yt-dlp extraction and ffmpeg handoff', () => {
     stream.destroy();
     await flushAsyncWork();
     await fs.rm(cookieFixtureDirectory, {recursive: true, force: true});
+  });
+
+  it('reports exhaustion after every player client returns a pre-audio ffmpeg 403', async () => {
+    process.env.YT_DLP_PATH = '/fake/yt-dlp';
+    const fileCache = {getPathFor: vi.fn().mockResolvedValue(null)};
+    const player = new Player(fileCache as never, GUILD_ID);
+    const song: QueuedSong = {
+      title: 'Exhausted 403 track',
+      artist: 'Artist',
+      url: 'abcdefghijk',
+      length: 3_600,
+      offset: 0,
+      playlist: null,
+      isLive: false,
+      thumbnailUrl: null,
+      source: MediaSource.Youtube,
+      addedInChannelId: 'text-channel-id',
+      requestedBy: 'requester-id',
+    };
+    const forbiddenDetail = '[https] HTTP error 403 Forbidden\nServer returned 403 Forbidden (access denied)';
+    dependencyMocks.ffmpeg.mockImplementation(() => makeFfmpegCommand(forbiddenDetail));
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    await expect((player as unknown as {
+      getStream(input: QueuedSong): Promise<Readable>;
+    }).getStream(song)).rejects.toBeInstanceOf(AllPlayerClientsExhaustedError);
+
+    expect(dependencyMocks.execa).toHaveBeenCalledTimes(4);
+    expect(dependencyMocks.ffmpeg).toHaveBeenCalledTimes(4);
   });
 });
 

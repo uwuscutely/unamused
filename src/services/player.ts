@@ -30,6 +30,7 @@ import {
 } from './player-types.js';
 import {destroyVoiceConnection, recoverVoiceConnection} from './voice-connection-recovery.js';
 import debug from '../utils/debug.js';
+import errorMsg from '../utils/error-msg.js';
 import {getGuildSettings} from '../utils/get-guild-settings.js';
 import {buildPlayingMessageEmbed} from '../utils/build-embed.js';
 import {getYouTubeMediaSource, YtDlpMediaUnavailableError} from '../utils/yt-dlp.js';
@@ -52,6 +53,25 @@ class FfmpegForbiddenError extends Error {
     this.name = 'FfmpegForbiddenError';
   }
 }
+
+export class AllPlayerClientsExhaustedError extends Error {
+  constructor(videoId: string) {
+    super(`All YouTube player clients exhausted for ${videoId}.`);
+    this.name = 'AllPlayerClientsExhaustedError';
+  }
+}
+
+const summarizeFfmpegError = (detail: string): string => {
+  const lines = detail
+    .split(/\r?\n/u)
+    .map(line => line.trim())
+    .filter(Boolean);
+  const diagnosticLines = lines.filter(line => (
+    /(?:HTTP error|Server returned|Forbidden|Invalid data|Conversion failed)/iu.test(line)
+  ));
+
+  return (diagnosticLines.length > 0 ? diagnosticLines.slice(-3) : lines.slice(-1)).join(' | ');
+};
 
 const appendPlaybackBounds = (ffmpegInputOptions: string[], options: {seek?: number; to?: number}) => {
   if (options.seek) {
@@ -633,6 +653,21 @@ export default class {
       && 'statusCode' in error
       && error.statusCode === 410;
 
+    if (error instanceof AllPlayerClientsExhaustedError) {
+      console.warn(`All YouTube player clients exhausted for guild ${this.guildId}; skipping ${playback.song.url}.`);
+      if (this.currentChannel) {
+        try {
+          await this.currentChannel.send(errorMsg('all player clients exhausted, skipping to next song'));
+        } catch (notificationError: unknown) {
+          const detail = notificationError instanceof Error ? notificationError.message : String(notificationError);
+          console.warn(`Could not announce exhausted YouTube player clients for guild ${this.guildId}: ${detail}`);
+        }
+      }
+
+      await this.advancePastUnplayableTrack();
+      return;
+    }
+
     if (error instanceof YtDlpMediaUnavailableError
       && error.reason === 'age-restricted'
       && allowAgeRestrictedFallback) {
@@ -724,8 +759,12 @@ export default class {
         const nextClient = extractionAttempts[index + 1]?.playerClient;
         const isForbidden = error instanceof FfmpegForbiddenError;
         retryingAfterForbidden ||= isForbidden;
-        if (!retryingAfterForbidden || !nextClient) {
+        if (!retryingAfterForbidden) {
           throw error;
+        }
+
+        if (!nextClient) {
+          throw new AllPlayerClientsExhaustedError(song.url);
         }
 
         console.warn(
@@ -885,10 +924,15 @@ export default class {
 
   private async onAudioPlayerIdle(_oldState: AudioPlayerState, newState: AudioPlayerState): Promise<void> {
     const idleSong = this.getCurrent();
-    debug(
-      `Audio player became ${newState.status} for ${idleSong?.url ?? 'unknown'} `
-      + `at ${this.positionInSeconds}s (expected length: ${idleSong?.length ?? 'unknown'}s)`,
-    );
+    if (newState.status === AudioPlayerStatus.Idle
+      && idleSong
+      && idleSong.length > 0
+      && this.positionInSeconds + 2 < idleSong.length) {
+      debug(
+        `Audio player became idle early for ${idleSong.url} `
+        + `at ${this.positionInSeconds}s (expected length: ${idleSong.length}s)`,
+      );
+    }
 
     // Automatically advance queued song at end
     if (this.loopCurrentSong && newState.status === AudioPlayerStatus.Idle && this.status === STATUS.PLAYING) {
@@ -1002,27 +1046,23 @@ export default class {
           const detail = (stderr || ffmpegStderr || error.message)
             .trim()
             .replace(/https?:\/\/\S*googlevideo\.com\/\S+/giu, '[redacted signed Google Video URL]');
-          console.error(`ffmpeg playback failed for ${options.cacheKey}: ${detail}`);
+          const summary = summarizeFfmpegError(detail);
+          console.error(`ffmpeg playback failed for ${options.cacheKey}: ${summary}`);
 
           if (!hasFfmpegOutput && !hasSettled) {
             hasSettled = true;
             returnedStream.destroy();
             reject(/(?:HTTP error 403|403 Forbidden|Server returned 403)/iu.test(detail)
-              ? new FfmpegForbiddenError(detail)
+              ? new FfmpegForbiddenError(summary)
               : error);
           }
         })
         .on('end', () => {
-          debug(`ffmpeg completed for ${options.cacheKey}`);
-
           if (!hasFfmpegOutput && !hasSettled) {
             hasSettled = true;
             returnedStream.destroy();
             reject(new Error(`ffmpeg produced no audio output for ${options.cacheKey}.`));
           }
-        })
-        .on('start', () => {
-          debug(`Spawned ffmpeg for ${options.cacheKey}`);
         });
 
       stream.pipe(outputProbe);

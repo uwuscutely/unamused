@@ -6,7 +6,7 @@ on:
       - completed
 
 env:
-  REGISTRY_IMAGE: ghcr.io/museofficial/muse
+  REGISTRY_IMAGE: ghcr.io/uwuscutely/unamused
 
 jobs:
   release-and-comment:
@@ -24,7 +24,7 @@ jobs:
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
-          username: ${{ github.repository_owner }}
+          username: uwuscutely
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Buildx

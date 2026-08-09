@@ -66,7 +66,14 @@ vi.mock('../src/utils/channels.js', () => ({
 
 import Play from '../src/commands/play.js';
 import AddQueryToQueue from '../src/services/add-query-to-queue.js';
-import Player, {MediaSource, QueuedSong, SongMetadata, STATUS} from '../src/services/player.js';
+import Player, {
+  AllPlayerClientsExhaustedError,
+  MediaSource,
+  QueuedSong,
+  SongMetadata,
+  STATUS,
+} from '../src/services/player.js';
+import errorMsg from '../src/utils/error-msg.js';
 import {getYouTubeMediaSource, YtDlpMediaUnavailableError} from '../src/utils/yt-dlp.js';
 
 const GUILD_ID = 'guild-id';
@@ -586,6 +593,53 @@ describe('PLAY-14 unplayable queue continuation preservation', () => {
     expect(player.status).toBe(STATUS.PLAYING);
     expect(getStream).toHaveBeenCalledTimes(2);
     expect(warning).toHaveBeenCalledOnce();
+  });
+
+  it('announces exhausted player clients in the playback channel and advances to the next song', async () => {
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const {getStream, player} = makeReadyPlayer();
+    const exhausted = makeQueuedSong('Exhausted clients');
+    const next = makeQueuedSong('Next playable');
+    const send = vi.fn().mockResolvedValue(undefined);
+    Object.assign(player, {currentChannel: {send}});
+    player.add(exhausted);
+    player.add(next);
+    getStream
+      .mockRejectedValueOnce(new AllPlayerClientsExhaustedError(exhausted.url))
+      .mockResolvedValueOnce(Readable.from([]));
+    const manualForward = vi.spyOn(player, 'manualForward');
+
+    await player.play();
+
+    expect(send).toHaveBeenCalledOnce();
+    expect(send).toHaveBeenCalledWith(errorMsg('all player clients exhausted, skipping to next song'));
+    expect(manualForward).toHaveBeenCalledOnce();
+    expect(manualForward).toHaveBeenCalledWith(1);
+    expect(player.getCurrent()).toBe(next);
+    expect(player.status).toBe(STATUS.PLAYING);
+    expect(getStream).toHaveBeenCalledTimes(2);
+    expect(warning).toHaveBeenCalledOnce();
+  });
+
+  it('still advances when the exhausted-client announcement cannot be sent', async () => {
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const {getStream, player} = makeReadyPlayer();
+    const exhausted = makeQueuedSong('Exhausted clients');
+    const next = makeQueuedSong('Next playable');
+    const send = vi.fn().mockRejectedValue(new Error('missing channel permission'));
+    Object.assign(player, {currentChannel: {send}});
+    player.add(exhausted);
+    player.add(next);
+    getStream
+      .mockRejectedValueOnce(new AllPlayerClientsExhaustedError(exhausted.url))
+      .mockResolvedValueOnce(Readable.from([]));
+
+    await player.play();
+
+    expect(send).toHaveBeenCalledOnce();
+    expect(player.getCurrent()).toBe(next);
+    expect(player.status).toBe(STATUS.PLAYING);
+    expect(warning).toHaveBeenCalledTimes(2);
   });
 
   it('finishes an unavailable final entry in IDLE and schedules only the configured idle timer', async () => {
