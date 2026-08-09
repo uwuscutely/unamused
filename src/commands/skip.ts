@@ -32,15 +32,15 @@ export default class implements Command {
     }
 
     const player = this.playerManager.get(interaction.guild!.id);
-
-    try {
-      await player.forward(numToSkip);
-      await interaction.reply({
-        content: 'keep \'er movin\'',
-        embeds: player.getCurrent() ? [buildPlayingMessageEmbed(player)] : [],
-      });
-    } catch (_: unknown) {
+    if (!player.canGoForward(numToSkip)) {
       throw new Error('no song to skip to');
     }
+
+    await interaction.deferReply();
+    await player.forward(numToSkip);
+    await interaction.editReply({
+      content: 'keep \'er movin\'',
+      embeds: player.getCurrent() ? [buildPlayingMessageEmbed(player)] : [],
+    });
   }
 }

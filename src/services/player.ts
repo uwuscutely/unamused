@@ -1,5 +1,5 @@
 import {VoiceChannel} from 'discord.js';
-import {Readable} from 'stream';
+import {Readable, Transform} from 'stream';
 import hasha from 'hasha';
 import {WriteStream} from 'fs-capacitor';
 import ffmpeg from 'fluent-ffmpeg';
@@ -39,6 +39,29 @@ export {DEFAULT_VOLUME, MediaSource, STATUS};
 export type {AgeRestrictedFallbackResolver, PlayerEvents, QueuedPlaylist, QueuedSong, SongMetadata};
 
 type PlayerPlaybackAttemptContext = PlaybackAttemptContext<QueuedSong, VoiceConnection>;
+
+const YOUTUBE_403_RETRY_ATTEMPTS = [
+  {playerClient: 'visionos', useCookies: false},
+  {playerClient: 'android_vr', useCookies: false},
+  {playerClient: 'web', useCookies: true},
+] as const;
+
+class FfmpegForbiddenError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'FfmpegForbiddenError';
+  }
+}
+
+const appendPlaybackBounds = (ffmpegInputOptions: string[], options: {seek?: number; to?: number}) => {
+  if (options.seek) {
+    ffmpegInputOptions.push('-ss', options.seek.toString());
+  }
+
+  if (options.to) {
+    ffmpegInputOptions.push('-to', options.to.toString());
+  }
+};
 
 export default class {
   public voiceConnection: VoiceConnection | null = null;
@@ -648,49 +671,72 @@ export default class {
       return this.createReadStream({url: song.url, cacheKey: song.url});
     }
 
-    let ffmpegInput: string | null;
-    const ffmpegInputOptions: string[] = [];
-    let shouldCacheVideo = false;
+    const cachedInput = await this.fileCache.getPathFor(this.getHashForCache(song.url));
+    if (cachedInput) {
+      const cachedInputOptions: string[] = [];
+      appendPlaybackBounds(cachedInputOptions, options);
 
-    ffmpegInput = await this.fileCache.getPathFor(this.getHashForCache(song.url));
-
-    if (!ffmpegInput) {
-      const mediaSource = await getYouTubeMediaSource(song.url);
-      ffmpegInput = mediaSource.url;
-
-      // Don't cache livestreams or long videos
-      const MAX_CACHE_LENGTH_SECONDS = 30 * 60; // 30 minutes
-      shouldCacheVideo = !mediaSource.isLive && song.length < MAX_CACHE_LENGTH_SECONDS && !options.seek;
-
-      debug(shouldCacheVideo ? 'Caching video' : 'Not caching video');
-
-      ffmpegInputOptions.push(...[
-        '-reconnect',
-        '1',
-        '-reconnect_streamed',
-        '1',
-        '-reconnect_delay_max',
-        '5',
-      ]);
-
-      const headerOptions = this.buildFfmpegHeaderOptions(mediaSource.headers);
-      ffmpegInputOptions.push(...headerOptions);
+      return this.createReadStream({
+        url: cachedInput,
+        cacheKey: song.url,
+        ffmpegInputOptions: cachedInputOptions,
+      });
     }
 
-    if (options.seek) {
-      ffmpegInputOptions.push('-ss', options.seek.toString());
+    const extractionAttempts: ReadonlyArray<{playerClient?: string; useCookies: boolean}> = [
+      {useCookies: true},
+      ...YOUTUBE_403_RETRY_ATTEMPTS,
+    ];
+    let retryingAfterForbidden = false;
+    for (const [index, {playerClient, useCookies}] of extractionAttempts.entries()) {
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        const mediaSource = await getYouTubeMediaSource(song.url, {playerClient, useCookies});
+        const ffmpegInputOptions = [
+          '-reconnect',
+          '1',
+          '-reconnect_streamed',
+          '1',
+          '-reconnect_delay_max',
+          '5',
+          ...this.buildFfmpegHeaderOptions(mediaSource.headers),
+        ];
+        appendPlaybackBounds(ffmpegInputOptions, options);
+
+        // Don't cache livestreams or long videos
+        const MAX_CACHE_LENGTH_SECONDS = 30 * 60; // 30 minutes
+        const shouldCacheVideo = !mediaSource.isLive
+          && song.length < MAX_CACHE_LENGTH_SECONDS
+          && !options.seek;
+        debug(`${shouldCacheVideo ? 'Caching' : 'Not caching'} video using ${playerClient ?? 'default'} client`);
+
+        // Waiting here lets a pre-audio ffmpeg 403 trigger the next client instead of
+        // being mistaken for a naturally completed Discord audio resource.
+        // eslint-disable-next-line no-await-in-loop
+        const stream = await this.createReadStream({
+          url: mediaSource.url,
+          cacheKey: song.url,
+          ffmpegInputOptions,
+          cache: shouldCacheVideo,
+        });
+        return stream;
+      } catch (error: unknown) {
+        const nextClient = extractionAttempts[index + 1]?.playerClient;
+        const isForbidden = error instanceof FfmpegForbiddenError;
+        retryingAfterForbidden ||= isForbidden;
+        if (!retryingAfterForbidden || !nextClient) {
+          throw error;
+        }
+
+        console.warn(
+          `${isForbidden ? 'ffmpeg received HTTP 403' : 'YouTube fallback failed'} for ${song.url} `
+          + `using ${playerClient ?? 'default'} client; `
+          + `retrying with ${nextClient}`,
+        );
+      }
     }
 
-    if (options.to) {
-      ffmpegInputOptions.push('-to', options.to.toString());
-    }
-
-    return this.createReadStream({
-      url: ffmpegInput,
-      cacheKey: song.url,
-      ffmpegInputOptions,
-      cache: shouldCacheVideo,
-    });
+    throw new Error(`No playable YouTube media source found for ${song.url}.`);
   }
 
   private startTrackingPosition(initalPosition?: number): void {
@@ -838,6 +884,12 @@ export default class {
   }
 
   private async onAudioPlayerIdle(_oldState: AudioPlayerState, newState: AudioPlayerState): Promise<void> {
+    const idleSong = this.getCurrent();
+    debug(
+      `Audio player became ${newState.status} for ${idleSong?.url ?? 'unknown'} `
+      + `at ${this.positionInSeconds}s (expected length: ${idleSong?.length ?? 'unknown'}s)`,
+    );
+
     // Automatically advance queued song at end
     if (this.loopCurrentSong && newState.status === AudioPlayerStatus.Idle && this.status === STATUS.PLAYING) {
       await this.seek(0);
@@ -913,6 +965,10 @@ export default class {
   private async createReadStream(options: {url: string; cacheKey: string; ffmpegInputOptions?: string[]; cache?: boolean}): Promise<Readable> {
     return new Promise((resolve, reject) => {
       const capacitor = new WriteStream();
+      let ffmpegStderr = '';
+      const maxFfmpegStderrCharacters = 32_768;
+      let hasFfmpegOutput = false;
+      let hasSettled = false;
 
       if (options?.cache) {
         const cacheStream = this.fileCache.createWriteStream(this.getHashForCache(options.cacheKey));
@@ -921,22 +977,55 @@ export default class {
 
       const returnedStream = capacitor.createReadStream();
       let hasReturnedStreamClosed = false;
+      const outputProbe = new Transform({
+        transform(chunk, _encoding, callback) {
+          if (!hasFfmpegOutput) {
+            hasFfmpegOutput = true;
+            hasSettled = true;
+            resolve(returnedStream);
+          }
+
+          callback(null, chunk);
+        },
+      });
+      outputProbe.pipe(capacitor);
 
       const stream = ffmpeg(options.url)
         .inputOptions(options?.ffmpegInputOptions ?? ['-re'])
         .noVideo()
         .audioCodec('libopus')
         .outputFormat('webm')
-        .on('error', error => {
-          if (!hasReturnedStreamClosed) {
-            reject(error);
+        .on('stderr', line => {
+          ffmpegStderr = `${ffmpegStderr}${line}\n`.slice(-maxFfmpegStderrCharacters);
+        })
+        .on('error', (error, _stdout, stderr) => {
+          const detail = (stderr || ffmpegStderr || error.message)
+            .trim()
+            .replace(/https?:\/\/\S*googlevideo\.com\/\S+/giu, '[redacted signed Google Video URL]');
+          console.error(`ffmpeg playback failed for ${options.cacheKey}: ${detail}`);
+
+          if (!hasFfmpegOutput && !hasSettled) {
+            hasSettled = true;
+            returnedStream.destroy();
+            reject(/(?:HTTP error 403|403 Forbidden|Server returned 403)/iu.test(detail)
+              ? new FfmpegForbiddenError(detail)
+              : error);
           }
         })
-        .on('start', command => {
-          debug(`Spawned ffmpeg with ${command}`);
+        .on('end', () => {
+          debug(`ffmpeg completed for ${options.cacheKey}`);
+
+          if (!hasFfmpegOutput && !hasSettled) {
+            hasSettled = true;
+            returnedStream.destroy();
+            reject(new Error(`ffmpeg produced no audio output for ${options.cacheKey}.`));
+          }
+        })
+        .on('start', () => {
+          debug(`Spawned ffmpeg for ${options.cacheKey}`);
         });
 
-      stream.pipe(capacitor);
+      stream.pipe(outputProbe);
 
       returnedStream.on('close', () => {
         if (!options.cache) {
@@ -945,8 +1034,6 @@ export default class {
 
         hasReturnedStreamClosed = true;
       });
-
-      resolve(returnedStream);
     });
   }
 

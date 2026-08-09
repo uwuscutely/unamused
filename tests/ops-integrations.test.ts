@@ -124,16 +124,29 @@ const flushAsyncWork = async () => {
   }
 };
 
-const makeFfmpegCommand = () => {
+const makeFfmpegCommand = (failureDetail?: string) => {
+  const handlers = new Map<string, (...args: unknown[]) => void>();
   const command = {
     audioCodec: vi.fn(() => command),
     inputOptions: vi.fn(() => command),
     kill: vi.fn(),
     noVideo: vi.fn(() => command),
-    on: vi.fn(() => command),
+    on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
+      handlers.set(event, handler);
+      return command;
+    }),
     outputFormat: vi.fn(() => command),
-    pipe: vi.fn((destination: {end(): void}) => {
+    pipe: vi.fn((destination: {end(): void; write(chunk: Buffer): void}) => {
+      handlers.get('start')?.('ffmpeg command');
+      if (failureDetail) {
+        handlers.get('error')?.(new Error('ffmpeg exited with code 1'), '', failureDetail);
+        destination.end();
+        return destination;
+      }
+
+      destination.write(Buffer.from('ffmpeg output'));
       destination.end();
+      handlers.get('end')?.();
       return destination;
     }),
   };
@@ -210,7 +223,7 @@ beforeEach(() => {
   delete process.env.YT_DLP_PATH;
   delete process.env.MUSE_BUNDLED_YT_DLP_PATH;
   dependencyMocks.execa.mockResolvedValue({stdout: VALID_MEDIA_RESPONSE});
-  dependencyMocks.ffmpeg.mockImplementation(makeFfmpegCommand);
+  dependencyMocks.ffmpeg.mockImplementation(() => makeFfmpegCommand());
   dependencyMocks.getGuildSettings.mockResolvedValue({
     defaultVolume: 100,
     turnDownVolumeWhenPeopleSpeak: false,
@@ -414,6 +427,34 @@ describe('OPS-11 yt-dlp extraction and ffmpeg handoff', () => {
     });
   });
 
+  it('passes an explicitly requested YouTube player client and can suppress configured cookies', async () => {
+    process.env.YT_DLP_PATH = '/fake/yt-dlp';
+    process.env.YT_DLP_COOKIES_PATH = '/configured/cookies.txt';
+
+    await getYouTubeMediaSource('abcdefghijk', {playerClient: 'android_vr', useCookies: false});
+
+    expect(dependencyMocks.execa).toHaveBeenCalledWith('/fake/yt-dlp', [
+      '--dump-single-json',
+      '--no-playlist',
+      '--skip-download',
+      '--no-warnings',
+      '--no-cache-dir',
+      '--js-runtimes',
+      'node',
+      '-f',
+      'bestaudio/best',
+      '-S',
+      'proto:https',
+      '--extractor-args',
+      'youtube:player_client=android_vr',
+      'https://www.youtube.com/watch?v=abcdefghijk',
+    ], {
+      timeout: 45_000,
+    });
+    const [, args] = dependencyMocks.execa.mock.calls[0] as [string, string[]];
+    expect(args).not.toContain('--cookies');
+  });
+
   it('hands reconnect and CRLF-normalized headers to ffmpeg', async () => {
     process.env.YT_DLP_PATH = '/fake/yt-dlp';
     const fileCache = {
@@ -456,6 +497,62 @@ describe('OPS-11 yt-dlp extraction and ffmpeg handoff', () => {
 
     stream.destroy();
     await flushAsyncWork();
+  });
+
+  it('re-extracts with each fallback client after pre-audio ffmpeg 403 responses', async () => {
+    process.env.YT_DLP_PATH = '/fake/yt-dlp';
+    const cookieFixtureDirectory = await fs.mkdtemp(path.join(tmpdir(), 'muse-retry-cookies-'));
+    process.env.YT_DLP_COOKIES_PATH = path.join(cookieFixtureDirectory, 'cookies.txt');
+    await fs.writeFile(process.env.YT_DLP_COOKIES_PATH, 'cookie bytes', 'utf8');
+    const fileCache = {getPathFor: vi.fn().mockResolvedValue(null)};
+    const player = new Player(fileCache as never, GUILD_ID);
+    const song: QueuedSong = {
+      title: '403 retry track',
+      artist: 'Artist',
+      url: 'abcdefghijk',
+      length: 3_600,
+      offset: 0,
+      playlist: null,
+      isLive: false,
+      thumbnailUrl: null,
+      source: MediaSource.Youtube,
+      addedInChannelId: 'text-channel-id',
+      requestedBy: 'requester-id',
+    };
+    const forbiddenDetail = '[https] HTTP error 403 Forbidden\nServer returned 403 Forbidden (access denied)';
+    dependencyMocks.ffmpeg
+      .mockImplementationOnce(() => makeFfmpegCommand(forbiddenDetail))
+      .mockImplementationOnce(() => makeFfmpegCommand(forbiddenDetail))
+      .mockImplementationOnce(() => makeFfmpegCommand(forbiddenDetail))
+      .mockImplementationOnce(() => makeFfmpegCommand());
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    const stream = await (player as unknown as {
+      getStream(input: QueuedSong): Promise<Readable>;
+    }).getStream(song);
+    const extractorArgs = dependencyMocks.execa.mock.calls.map(([, args]) => {
+      const values = args as string[];
+      const extractorArgsIndex = values.indexOf('--extractor-args');
+      return extractorArgsIndex === -1 ? null : values[extractorArgsIndex + 1];
+    });
+    const cookieUsage = dependencyMocks.execa.mock.calls.map(([, args]) => (
+      (args as string[]).includes('--cookies')
+    ));
+
+    expect(extractorArgs).toEqual([
+      null,
+      'youtube:player_client=visionos',
+      'youtube:player_client=android_vr',
+      'youtube:player_client=web',
+    ]);
+    expect(cookieUsage).toEqual([true, false, false, true]);
+    expect(dependencyMocks.ffmpeg).toHaveBeenCalledTimes(4);
+    expect(warn).toHaveBeenCalledTimes(3);
+
+    stream.destroy();
+    await flushAsyncWork();
+    await fs.rm(cookieFixtureDirectory, {recursive: true, force: true});
   });
 });
 
