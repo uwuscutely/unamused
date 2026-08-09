@@ -1,8 +1,8 @@
 {
   "name": "muse",
   "version": "2.11.6",
-  "description": "🎧 a self-hosted Discord music bot that doesn't suck ",
-  "repository": "git@github.com:museofficial/muse.git",
+  "description": "🎧 a self-hosted midwestern Discord music bot vibe code fixed by ChatGPT that doesn't suck...until it does ",
+  "repository": "git@github.com:uwuscutely/unamused.git",
   "author": "Max Isom <hi@maxisom.me>",
   "license": "MIT",
   "private": true,
