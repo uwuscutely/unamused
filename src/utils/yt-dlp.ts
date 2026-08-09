@@ -28,6 +28,11 @@ export interface YtDlpMediaSource {
   readonly isLive: boolean;
 }
 
+export interface YtDlpExtractionOptions {
+  readonly playerClient?: string;
+  readonly useCookies?: boolean;
+}
+
 export interface YtDlpUpdateResult {
   readonly beforeVersion: string | null;
   readonly afterVersion: string | null;
@@ -294,9 +299,14 @@ export const updateYtDlp = async (): Promise<YtDlpUpdateResult> => {
   };
 };
 
-export const getYouTubeMediaSource = async (videoIdOrUrl: string): Promise<YtDlpMediaSource> => {
+export const getYouTubeMediaSource = async (
+  videoIdOrUrl: string,
+  options: YtDlpExtractionOptions = {},
+): Promise<YtDlpMediaSource> => {
+  const {playerClient, useCookies = true} = options;
+
   try {
-    return await withTemporaryCookies(async cookiesPath => {
+    const extract = async (cookiesPath?: string) => {
       const args = [
         '--dump-single-json',
         '--no-playlist',
@@ -313,6 +323,10 @@ export const getYouTubeMediaSource = async (videoIdOrUrl: string): Promise<YtDlp
 
       if (cookiesPath) {
         args.push('--cookies', cookiesPath);
+      }
+
+      if (playerClient) {
+        args.push('--extractor-args', `youtube:player_client=${playerClient}`);
       }
 
       args.push(toYouTubeWatchUrl(videoIdOrUrl));
@@ -333,7 +347,11 @@ export const getYouTubeMediaSource = async (videoIdOrUrl: string): Promise<YtDlp
         headers: normalizeHeaders(download.http_headers ?? response.http_headers),
         isLive: Boolean(response.is_live ?? (response.live_status === 'is_live')),
       };
-    });
+    };
+
+    return useCookies
+      ? await withTemporaryCookies(extract)
+      : await extract();
   } catch (error: unknown) {
     if (isExecaError(error)) {
       const detail = error.stderr?.trim() ?? error.shortMessage ?? 'Unknown yt-dlp error';

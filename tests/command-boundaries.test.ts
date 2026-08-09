@@ -354,6 +354,56 @@ describe('/stop', () => {
   });
 });
 
+describe('/skip', () => {
+  it('defers before loading the destination and edits the deferred response', async () => {
+    const player = {
+      canGoForward: vi.fn(() => true),
+      forward: vi.fn().mockResolvedValue(undefined),
+      getCurrent: vi.fn(() => null),
+    };
+    const {interaction, reply, deferReply, editReply} = makeInteraction();
+
+    await new Skip(managerFor(player) as never).execute(interaction);
+
+    expect(player.canGoForward).toHaveBeenCalledWith(1);
+    expect(deferReply).toHaveBeenCalledOnce();
+    expect(player.forward).toHaveBeenCalledWith(1);
+    expect(deferReply.mock.invocationCallOrder[0]).toBeLessThan(player.forward.mock.invocationCallOrder[0]);
+    expect(editReply).toHaveBeenCalledWith({content: 'keep \'er movin\'', embeds: []});
+    expect(reply).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unavailable destination before deferring', async () => {
+    const player = {
+      canGoForward: vi.fn(() => false),
+      forward: vi.fn(),
+      getCurrent: vi.fn(() => null),
+    };
+    const {interaction, deferReply, editReply} = makeInteraction();
+
+    await expect(new Skip(managerFor(player) as never).execute(interaction)).rejects.toThrow('no song to skip to');
+
+    expect(player.forward).not.toHaveBeenCalled();
+    expect(deferReply).not.toHaveBeenCalled();
+    expect(editReply).not.toHaveBeenCalled();
+  });
+
+  it('preserves playback failures after acknowledging the interaction', async () => {
+    const playbackError = new Error('all YouTube clients failed');
+    const player = {
+      canGoForward: vi.fn(() => true),
+      forward: vi.fn().mockRejectedValue(playbackError),
+      getCurrent: vi.fn(() => null),
+    };
+    const {interaction, deferReply, editReply} = makeInteraction();
+
+    await expect(new Skip(managerFor(player) as never).execute(interaction)).rejects.toBe(playbackError);
+
+    expect(deferReply).toHaveBeenCalledOnce();
+    expect(editReply).not.toHaveBeenCalled();
+  });
+});
+
 describe('seek parsing', () => {
   it('rejects duration strings with trailing junk or no duration', () => {
     expect(durationStringToSeconds('1m trailing')).toBeNaN();
