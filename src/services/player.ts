@@ -1020,7 +1020,6 @@ export default class {
       }
 
       const returnedStream = capacitor.createReadStream();
-      let hasReturnedStreamClosed = false;
       const outputProbe = new Transform({
         transform(chunk, _encoding, callback) {
           if (!hasFfmpegOutput) {
@@ -1043,7 +1042,9 @@ export default class {
           ffmpegStderr = `${ffmpegStderr}${line}\n`.slice(-maxFfmpegStderrCharacters);
         })
         .on('error', (error, _stdout, stderr) => {
-          const detail = (stderr || ffmpegStderr || error.message)
+          const rawDetail = [stderr, ffmpegStderr, error.message]
+            .find(value => typeof value === 'string' && value.trim().length > 0);
+          const detail = (rawDetail ?? error.message)
             .trim()
             .replace(/https?:\/\/\S*googlevideo\.com\/\S+/giu, '[redacted signed Google Video URL]');
           const summary = summarizeFfmpegError(detail);
@@ -1071,8 +1072,6 @@ export default class {
         if (!options.cache) {
           stream.kill('SIGKILL');
         }
-
-        hasReturnedStreamClosed = true;
       });
     });
   }
